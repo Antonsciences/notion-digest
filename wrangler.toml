@@ -1,0 +1,4 @@
+name = "notion-digest-kayser"
+type = "javascript"
+
+[env.production]
