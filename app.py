@@ -11,6 +11,9 @@ from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 import os
 from dotenv import load_dotenv
+import io
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 # ── Chargement des variables d'environnement / secrets ──────────────────────────────────
 load_dotenv()
@@ -218,6 +221,72 @@ def flatten_tasks_for_text(root_tasks: list[dict], level=0) -> str:
             text += flatten_tasks_for_text(t["subtasks"], level + 1)
     return text
 
+def export_to_excel(root_tasks: list[dict]) -> bytes:
+    """Exporte les tâches dans un fichier Excel."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Tâches"
+    
+    # Styles
+    header_fill = PatternFill(start_color="C8A96E", end_color="C8A96E", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF")
+    border = Border(
+        left=Side(style='thin'),
+        right=Side(style='thin'),
+        top=Side(style='thin'),
+        bottom=Side(style='thin')
+    )
+    
+    # En-têtes
+    headers = ["Tâche", "Niveau", "Statut", "Date d'échéance", "Rappel"]
+    ws.append(headers)
+    
+    # Style en-têtes
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+    
+    # Largeurs des colonnes
+    ws.column_dimensions['A'].width = 40
+    ws.column_dimensions['B'].width = 10
+    ws.column_dimensions['C'].width = 15
+    ws.column_dimensions['D'].width = 15
+    ws.column_dimensions['E'].width = 15
+    
+    # Remplir les données
+    def add_task_to_excel(task, level=0):
+        ws.append([
+            task['title'],
+            "Sous-tâche" if level > 0 else "Principale",
+            task.get('status', ''),
+            format_date(task['due_date']) if task.get('due_date') else '',
+            format_date(task['reminder']) if task.get('reminder') else ''
+        ])
+        
+        row = ws.max_row
+        for cell in ws[row]:
+            cell.border = border
+            cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
+        
+        # Indentation pour les sous-tâches
+        if level > 0:
+            ws[row][0].value = "    " * level + "↳ " + task['title']
+        
+        # Ajouter les sous-tâches
+        for subtask in task['subtasks']:
+            add_task_to_excel(subtask, level + 1)
+    
+    for task in root_tasks:
+        add_task_to_excel(task)
+    
+    # Enregistrer en mémoire
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
+
 def send_digest(recipient: str) -> tuple[bool, str]:
     root_tasks, err = fetch_notion_tasks()
     if err:
@@ -291,6 +360,15 @@ if st.button("👁 Prévisualiser les tâches Notion"):
                     render_preview(t["subtasks"], level + 1)
                     
         render_preview(root_tasks)
+        
+        # Bouton export Excel
+        excel_data = export_to_excel(root_tasks)
+        st.download_button(
+            label="📥 Télécharger en Excel",
+            data=excel_data,
+            file_name=f"Taches_Notion_{datetime.now().strftime('%d-%m-%Y')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
 st.divider()
 
