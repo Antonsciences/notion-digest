@@ -12,8 +12,9 @@ from datetime import datetime
 import os
 from dotenv import load_dotenv
 import io
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+import pandas as pd
 
 # ── Chargement des variables d'environnement / secrets ──────────────────────────────────
 load_dotenv()
@@ -45,7 +46,31 @@ def format_date(date_str):
     except:
         return date_str
 
-def fetch_notion_tasks() -> tuple[list[dict], str | None]:
+def parse_date(date_str):
+    """Parse une date depuis un string (Excel ou autre format)."""
+    if not date_str or date_str == '':
+        return None
+    try:
+        # Essayer format français d'abord
+        dt = datetime.strptime(str(date_str), '%d/%m/%Y')
+        return dt.strftime('%Y-%m-%d')
+    except:
+        try:
+            # Essayer format ISO
+            dt = datetime.strptime(str(date_str), '%Y-%m-%d')
+            return dt.strftime('%Y-%m-%d')
+        except:
+            return None
+
+def get_task_by_title(tasks_map, title):
+    """Trouve une tâche par son titre."""
+    for task_id, task in tasks_map.items():
+        if task['title'].strip() == title.strip():
+            return task_id
+    return None
+
+def fetch_notion_tasks() -> tuple[list[dict], dict, str | None]:
+    """Récupère les tâches depuis Notion et retourne aussi la map complète."""
     url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -53,7 +78,6 @@ def fetch_notion_tasks() -> tuple[list[dict], str | None]:
         "Content-Type": "application/json",
     }
     
-    # On boucle avec pagination pour bien récupérer tout (au cas où il y en a bcp)
     pages = []
     has_more = True
     next_cursor = None
@@ -66,17 +90,16 @@ def fetch_notion_tasks() -> tuple[list[dict], str | None]:
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=10)
         except requests.exceptions.RequestException as e:
-            return [], f"Erreur réseau : {e}"
+            return [], {}, f"Erreur réseau : {e}"
 
         if resp.status_code != 200:
-            return [], f"Erreur Notion {resp.status_code} : {resp.text}"
+            return [], {}, f"Erreur Notion {resp.status_code} : {resp.text}"
             
         data = resp.json()
         pages.extend(data.get('results', []))
         has_more = data.get('has_more', False)
         next_cursor = data.get('next_cursor')
 
-    # Dictionnaire des tâches : id -> {title, subtasks: [], parent_id, status, due_date, reminder}
     tasks_map = {}
     
     for page in pages:
@@ -90,7 +113,6 @@ def fetch_notion_tasks() -> tuple[list[dict], str | None]:
         try:
             props = page['properties']
             
-            # Chercher le titre
             for prop_value in props.values():
                 if prop_value.get('type') == 'title':
                     texts = prop_value.get('title', [])
@@ -98,25 +120,21 @@ def fetch_notion_tasks() -> tuple[list[dict], str | None]:
                         title = texts[0]['plain_text']
                     break
                     
-            # Chercher "Parent task"
             if 'Parent task' in props and props['Parent task']['type'] == 'relation':
                 rel_data = props['Parent task'].get('relation', [])
                 if rel_data:
                     parent_id = rel_data[0]['id']
             
-            # Chercher le statut
             if 'Statut de la tâche' in props and props['Statut de la tâche']['type'] == 'status':
                 status_data = props['Statut de la tâche'].get('status')
                 if status_data:
                     status = status_data.get('name')
             
-            # Chercher la date d'échéance
             if 'Date d\'échéance' in props and props['Date d\'échéance']['type'] == 'date':
                 date_data = props['Date d\'échéance'].get('date')
                 if date_data:
                     due_date = date_data.get('start')
             
-            # Chercher le rappel
             if 'Rappel' in props and props['Rappel']['type'] == 'date':
                 reminder_data = props['Rappel'].get('date')
                 if reminder_data:
@@ -134,17 +152,117 @@ def fetch_notion_tasks() -> tuple[list[dict], str | None]:
             "reminder": reminder
         }
 
-    # Construire la hiérarchie
     root_tasks = []
     for pid, task in tasks_map.items():
         parent_id = task["parent_id"]
-        # Si la tâche a un parent et que ce parent existe dans notre map
         if parent_id and parent_id in tasks_map:
             tasks_map[parent_id]["subtasks"].append(task)
         else:
             root_tasks.append(task)
 
-    return root_tasks, None
+    return root_tasks, tasks_map, None
+
+
+def update_notion_task(task_id: str, status: str = None, due_date: str = None, reminder: str = None) -> tuple[bool, str]:
+    """Met à jour une tâche dans Notion."""
+    url = f"https://api.notion.com/v1/pages/{task_id}"
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+    
+    properties = {}
+    
+    # Mettre à jour le statut
+    if status:
+        properties["Statut de la tâche"] = {
+            "status": {
+                "name": status
+            }
+        }
+    
+    # Mettre à jour la date d'échéance
+    if due_date:
+        properties["Date d\'échéance"] = {
+            "date": {
+                "start": due_date
+            }
+        }
+    
+    # Mettre à jour le rappel
+    if reminder:
+        properties["Rappel"] = {
+            "date": {
+                "start": reminder
+            }
+        }
+    
+    if not properties:
+        return True, "Aucune modification"
+    
+    payload = {"properties": properties}
+    
+    try:
+        resp = requests.patch(url, headers=headers, json=payload, timeout=10)
+        if resp.status_code in [200, 202]:
+            return True, "Mise à jour réussie"
+        else:
+            return False, f"Erreur {resp.status_code}: {resp.text}"
+    except Exception as e:
+        return False, f"Erreur : {e}"
+
+
+def import_from_excel(excel_file, tasks_map: dict) -> tuple[int, list]:
+    """Importe et met à jour les tâches depuis un fichier Excel."""
+    try:
+        df = pd.read_excel(excel_file)
+        
+        updated = 0
+        errors = []
+        
+        for idx, row in df.iterrows():
+            task_title = row.get('Tâche', '').strip()
+            new_status = row.get('Statut', '').strip() if pd.notna(row.get('Statut')) else None
+            new_due_date = row.get('Date d\'échéance', '') if pd.notna(row.get('Date d\'échéance')) else None
+            new_reminder = row.get('Rappel', '') if pd.notna(row.get('Rappel')) else None
+            
+            # Ignorer les lignes vides ou en-têtes
+            if not task_title or task_title == 'Tâche':
+                continue
+            
+            # Supprimer les préfixes des sous-tâches pour la recherche
+            clean_title = task_title.replace('↳ ', '').strip()
+            for i in range(5):
+                clean_title = clean_title.replace('    ', '')
+            
+            # Trouver la tâche dans la map
+            task_id = get_task_by_title(tasks_map, clean_title)
+            
+            if task_id:
+                # Parser les dates
+                due_date_parsed = parse_date(new_due_date) if new_due_date else None
+                reminder_parsed = parse_date(new_reminder) if new_reminder else None
+                
+                # Mettre à jour
+                ok, msg = update_notion_task(
+                    task_id,
+                    status=new_status if new_status else None,
+                    due_date=due_date_parsed,
+                    reminder=reminder_parsed
+                )
+                
+                if ok:
+                    updated += 1
+                else:
+                    errors.append(f"Ligne {idx + 2}: {task_title} - {msg}")
+            else:
+                errors.append(f"Ligne {idx + 2}: Tâche '{clean_title}' non trouvée dans Notion")
+        
+        return updated, errors
+        
+    except Exception as e:
+        return 0, [f"Erreur de lecture du fichier: {str(e)}"]
 
 
 def build_email_html(root_tasks: list[dict]) -> str:
@@ -153,7 +271,6 @@ def build_email_html(root_tasks: list[dict]) -> str:
     def render_task_html(task) -> str:
         status_badge = ""
         if task.get('status'):
-            # Couleurs selon le statut
             status_colors = {
                 "Pas démarré": "#FF6B6B",
                 "En cours": "#4ECDC4",
@@ -227,7 +344,6 @@ def export_to_excel(root_tasks: list[dict]) -> bytes:
     ws = wb.active
     ws.title = "Tâches"
     
-    # Styles
     header_fill = PatternFill(start_color="C8A96E", end_color="C8A96E", fill_type="solid")
     header_font = Font(bold=True, color="FFFFFF")
     border = Border(
@@ -237,25 +353,21 @@ def export_to_excel(root_tasks: list[dict]) -> bytes:
         bottom=Side(style='thin')
     )
     
-    # En-têtes
     headers = ["Tâche", "Niveau", "Statut", "Date d'échéance", "Rappel"]
     ws.append(headers)
     
-    # Style en-têtes
     for cell in ws[1]:
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center")
         cell.border = border
     
-    # Largeurs des colonnes
     ws.column_dimensions['A'].width = 40
     ws.column_dimensions['B'].width = 10
     ws.column_dimensions['C'].width = 15
     ws.column_dimensions['D'].width = 15
     ws.column_dimensions['E'].width = 15
     
-    # Remplir les données
     def add_task_to_excel(task, level=0):
         ws.append([
             task['title'],
@@ -270,30 +382,27 @@ def export_to_excel(root_tasks: list[dict]) -> bytes:
             cell.border = border
             cell.alignment = Alignment(horizontal="left", vertical="top", wrap_text=True)
         
-        # Indentation pour les sous-tâches
         if level > 0:
             ws[row][0].value = "    " * level + "↳ " + task['title']
         
-        # Ajouter les sous-tâches
         for subtask in task['subtasks']:
             add_task_to_excel(subtask, level + 1)
     
     for task in root_tasks:
         add_task_to_excel(task)
     
-    # Enregistrer en mémoire
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
     return output.getvalue()
 
 def send_digest(recipient: str) -> tuple[bool, str]:
-    root_tasks, err = fetch_notion_tasks()
+    root_tasks, _, err = fetch_notion_tasks()
     if err:
         return False, err
 
     if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
-        return False, "GMAIL_ADDRESS ou GMAIL_APP_PASSWORD manquant dans le fichier .env"
+        return False, "GMAIL_ADDRESS ou GMAIL_APP_PASSWORD manquant"
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"📝 Récapitulatif Notion — {datetime.now().strftime('%d/%m/%Y')}"
@@ -313,12 +422,7 @@ def send_digest(recipient: str) -> tuple[bool, str]:
             server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
             server.sendmail(GMAIL_ADDRESS, recipient, msg.as_string())
     except smtplib.SMTPAuthenticationError:
-        return False, (
-            "Authentification Gmail échouée.\n"
-            "Vérifiez GMAIL_APP_PASSWORD dans .env — "
-            "il doit s'agir d'un mot de passe d'application (16 caractères), "
-            "pas de votre mot de passe Gmail habituel."
-        )
+        return False, "Authentification Gmail échouée"
     except Exception as e:
         return False, f"Erreur SMTP : {e}"
 
@@ -333,55 +437,86 @@ st.caption("Maison Eric Kayser Asie Ltd")
 st.write("Générez et envoyez par e-mail un récapitulatif de vos tâches Notion.")
 st.divider()
 
-if st.button("👁 Prévisualiser les tâches Notion"):
-    with st.spinner("Chargement depuis Notion..."):
-        root_tasks, err = fetch_notion_tasks()
-    if err:
-        st.error(err)
-        st.info("💡 Vérifiez que le bot Notion est bien invité sur la base de données.")
-    elif not root_tasks:
-        st.warning("Aucune tâche trouvée dans la base Notion.")
-    else:
-        st.success("Tâches trouvées :")
-        
-        def render_preview(tasks, level=0):
-            for t in tasks:
-                indent = "&nbsp;" * (level * 8)
-                prefix = "•" if level == 0 else "◦"
-                
-                # Construire la ligne avec statut et dates
-                status_str = f" **[{t['status']}]**" if t.get('status') else ""
-                due_date_str = f" 📅 {format_date(t['due_date'])}" if t.get('due_date') else ""
-                reminder_str = f" 🔔 {format_date(t['reminder'])}" if t.get('reminder') else ""
-                
-                full_text = f"{indent} {prefix} **{t['title']}**{status_str}{due_date_str}{reminder_str}" if level == 0 else f"{indent} {prefix} {t['title']}{status_str}{due_date_str}{reminder_str}"
-                st.markdown(full_text)
-                if t["subtasks"]:
-                    render_preview(t["subtasks"], level + 1)
-                    
-        render_preview(root_tasks)
-        
-        # Bouton export Excel
-        excel_data = export_to_excel(root_tasks)
-        st.download_button(
-            label="📥 Télécharger en Excel",
-            data=excel_data,
-            file_name=f"Taches_Notion_{datetime.now().strftime('%d-%m-%Y')}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+# Tab 1 : Prévisualisation
+tab1, tab2, tab3 = st.tabs(["👁 Prévisualisation", "📤 Importer Excel", "🚀 Envoyer Email"])
 
-st.divider()
-
-target_email = st.text_input("Adresse e-mail de réception :", value=DEFAULT_EMAIL)
-
-if st.button("🚀 Envoyer le Digest par e-mail", type="primary"):
-    if not target_email:
-        st.warning("Veuillez saisir une adresse e-mail.")
-    else:
-        with st.spinner("Extraction Notion et envoi via Gmail..."):
-            ok, msg = send_digest(target_email)
-        if ok:
-            st.success(msg)
+with tab1:
+    if st.button("Charger les tâches"):
+        with st.spinner("Chargement depuis Notion..."):
+            root_tasks, tasks_map, err = fetch_notion_tasks()
+        if err:
+            st.error(err)
+            st.info("💡 Vérifiez que le bot Notion est bien invité sur la base de données.")
+        elif not root_tasks:
+            st.warning("Aucune tâche trouvée dans la base Notion.")
         else:
-            st.error(msg)
-            st.info("💡 Vérifiez GMAIL_ADDRESS et GMAIL_APP_PASSWORD dans votre .env")
+            st.success("Tâches trouvées :")
+            
+            def render_preview(tasks, level=0):
+                for t in tasks:
+                    indent = "&nbsp;" * (level * 8)
+                    prefix = "•" if level == 0 else "◦"
+                    
+                    status_str = f" **[{t['status']}]**" if t.get('status') else ""
+                    due_date_str = f" 📅 {format_date(t['due_date'])}" if t.get('due_date') else ""
+                    reminder_str = f" 🔔 {format_date(t['reminder'])}" if t.get('reminder') else ""
+                    
+                    full_text = f"{indent} {prefix} **{t['title']}**{status_str}{due_date_str}{reminder_str}" if level == 0 else f"{indent} {prefix} {t['title']}{status_str}{due_date_str}{reminder_str}"
+                    st.markdown(full_text)
+                    if t["subtasks"]:
+                        render_preview(t["subtasks"], level + 1)
+                        
+            render_preview(root_tasks)
+            
+            # Bouton export Excel
+            excel_data = export_to_excel(root_tasks)
+            st.download_button(
+                label="📥 Télécharger en Excel",
+                data=excel_data,
+                file_name=f"Taches_Notion_{datetime.now().strftime('%d-%m-%Y')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+with tab2:
+    st.subheader("📤 Importer et mettre à jour depuis Excel")
+    st.info("Modifiez le fichier Excel téléchargé et réuploadez-le pour mettre à jour Notion")
+    
+    uploaded_file = st.file_uploader("Choisir un fichier Excel", type=['xlsx'])
+    
+    if uploaded_file:
+        if st.button("Importer et mettre à jour"):
+            with st.spinner("Chargement de Notion..."):
+                root_tasks, tasks_map, err = fetch_notion_tasks()
+            
+            if err:
+                st.error(err)
+            else:
+                with st.spinner("Mise à jour en cours..."):
+                    updated, errors = import_from_excel(uploaded_file, tasks_map)
+                
+                if updated > 0:
+                    st.success(f"✅ {updated} tâche(s) mise(s) à jour")
+                
+                if errors:
+                    st.warning(f"⚠️  {len(errors)} erreur(s) détectée(s):")
+                    for error in errors:
+                        st.write(f"• {error}")
+                
+                if updated == 0 and not errors:
+                    st.info("Aucune tâche à mettre à jour")
+
+with tab3:
+    st.subheader("🚀 Envoyer le Digest par Email")
+    
+    target_email = st.text_input("Adresse e-mail de réception :", value=DEFAULT_EMAIL)
+    
+    if st.button("Envoyer le Digest", type="primary"):
+        if not target_email:
+            st.warning("Veuillez saisir une adresse e-mail.")
+        else:
+            with st.spinner("Extraction Notion et envoi via Gmail..."):
+                ok, msg = send_digest(target_email)
+            if ok:
+                st.success(msg)
+            else:
+                st.error(msg)
